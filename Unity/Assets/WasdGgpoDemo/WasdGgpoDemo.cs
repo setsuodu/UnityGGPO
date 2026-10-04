@@ -12,7 +12,7 @@ namespace WasdDemo {
     /// <summary>
     /// Drop this on ONE empty GameObject in an empty scene and press Play. No prefabs, no UI setup.
     ///
-    ///   solid square       = PlayerView: the state GGPO is running right now (local = blue, remote = orange).
+    ///   solid square       = PlayerView: the state GGPO is running right now (P0 = blue, P1 = orange, fixed by index).
     ///                        The remote square is PREDICTED (peer's last input is assumed to continue).
     ///   hollow square      = Ghost: the same two players, but taken from History[head - 8 frames].
     ///                        GGPO cannot roll back past that, so it is the non-predicted, finalized timeline.
@@ -42,8 +42,9 @@ namespace WasdDemo {
 
         private const double FRAME_MS = 1000.0 / 60.0;
         private const float MARKER_LIFE = 2.5f;
-        private static readonly Color LocalColor = new Color(0.25f, 0.65f, 1f);
-        private static readonly Color RemoteColor = new Color(1f, 0.6f, 0.15f);
+        // Fixed colors by player index (not local/remote): P0 = blue, P1 = orange.
+        private static readonly Color Player0Color = new Color(0.25f, 0.65f, 1f);
+        private static readonly Color Player1Color = new Color(1f, 0.6f, 0.15f);
         private static readonly Color RollbackColor = new Color(1f, 0.2f, 0.25f);
 
         private static GGPO.LogDelegate pluginLogDelegate;   // keep alive (native holds a raw pointer)
@@ -340,12 +341,13 @@ namespace WasdDemo {
                 lagLineSR[i].transform.localScale = new Vector3(d, 0.04f, 1f);
                 lagLineSR[i].transform.rotation = Quaternion.Euler(0, 0, Mathf.Atan2(pp.y - gp.y, pp.x - gp.x) * Mathf.Rad2Deg);
             }
-            playerSR[me].color = LocalColor;
-            playerSR[1 - me].color = RemoteColor;
-            ghostSR[me].color = LocalColor;
-            ghostSR[1 - me].color = RemoteColor;
-            lagLineSR[me].color = new Color(LocalColor.r, LocalColor.g, LocalColor.b, 0.5f);
-            lagLineSR[1 - me].color = new Color(RemoteColor.r, RemoteColor.g, RemoteColor.b, 0.5f);
+            // Fixed colors by player index (not by local/remote).
+            playerSR[0].color = Player0Color;
+            playerSR[1].color = Player1Color;
+            ghostSR[0].color = Player0Color;
+            ghostSR[1].color = Player1Color;
+            lagLineSR[0].color = new Color(Player0Color.r, Player0Color.g, Player0Color.b, 0.5f);
+            lagLineSR[1].color = new Color(Player1Color.r, Player1Color.g, Player1Color.b, 0.5f);
 
             // arena border flashes red whenever a rollback just happened
             flash = Mathf.Max(0f, flash - Time.deltaTime);
@@ -467,7 +469,7 @@ namespace WasdDemo {
         private void DrawHud() {
             var sb = new StringBuilder(512);
             int head = runner.State.frame;
-            string you = "#4aa6ff", rem = "#ff9a26", red = "#ff4050";
+            string p0 = "#4aa6ff", p1 = "#ff9a26", red = "#ff4050";
 
             sb.AppendLine("<b>WASD GGPO</b>   you = P" + runner.LocalIndex + "   <b>" + runner.Status + "</b>"
                 + (bot ? "   <color=#ffe060>[BOT]</color>" : ""));
@@ -494,7 +496,7 @@ namespace WasdDemo {
             GUI.Box(new Rect(10, 10, 700, 170), sb.ToString(), boxStyle);
 
             string legend =
-                "<color=" + you + ">■</color> you (PlayerView)   <color=" + rem + ">■</color> remote (predicted)   " +
+                "<color=" + p0 + ">■</color> P0 (blue)   <color=" + p1 + ">■</color> P1 (orange)   " +
                 "□ ghost = newest frame with real inputs (head - latency), line = predicted part\n" +
                 "<color=" + red + ">▭</color> where it was drawn before a rollback (only when a rollback moved it), border flashes red   " +
                 "WASD move   B bot   G ghost";
