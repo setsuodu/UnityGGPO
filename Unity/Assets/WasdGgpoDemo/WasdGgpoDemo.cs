@@ -18,11 +18,15 @@ namespace WasdDemo {
     ///                        GGPO cannot roll back past that, so it is the non-predicted, finalized timeline.
     ///   red hollow + line  = what you were SHOWN before a rollback  ->  where the corrected state put it.
     ///
-    /// Command line (for two builds on one box):  -player 0|1  -lport N  -rip IP  -rport N  -delay N  -bot  -autostart
+    /// Command line (two builds on one box):
+    ///   Host:   -host -bot -autostart
+    ///   Client: -join 127.0.0.1 -bot -autostart
+    /// (or legacy -player 0|1 -rip IP -lport N -rport N -delay N)
     /// </summary>
     public class WasdGgpoDemo : MonoBehaviour {
 
         [Header("Session")]
+        [Tooltip("0 = Host (P0), 1 = Client (P1) — set by room OnReady")]
         public int playerIndex = 0;
         public int localPort = 7000;
         public string remoteIp = "127.0.0.1";
@@ -30,6 +34,14 @@ namespace WasdDemo {
         [Tooltip("GGPO local input delay (frames). Higher = fewer rollbacks, more input lag.")]
         public int frameDelay = 2;
         public bool autoStart = false;
+
+        [Header("TCP Room (FishNet-style Host / Join)")]
+        [Tooltip("Hardcoded room host IP. Host machine should use this LAN IP (or change at runtime).")]
+        public string roomHostIp = WasdRoom.DefaultRoomHostIp; // 192.168.1.101
+        public int roomPort = WasdRoom.DefaultRoomPort;         // 9000
+
+        private const int DefaultHostPort = 7000;
+        private const int DefaultClientPort = 7001;
 
         [Header("Test helpers")]
         [Tooltip("Scripted WASD square-wave instead of the keyboard (key: B). Gives repeatable mispredictions.")]
@@ -50,12 +62,14 @@ namespace WasdDemo {
         private static GGPO.LogDelegate pluginLogDelegate;   // keep alive (native holds a raw pointer)
 
         private WasdRunner runner;
+        private WasdRoom room;
         private readonly Stopwatch clock = new Stopwatch();
         private double nextTickMs;
         private string error = "";
+        private string roomStatus = "";
 
         // setup-panel text fields
-        private string sLocalPort, sRemoteIp, sRemotePort, sDelay;
+        private string sRoomHostIp, sRoomPort, sDelay;
 
         // views
         private Sprite filledSprite, hollowSprite;
@@ -94,8 +108,8 @@ namespace WasdDemo {
             if (autoStart) StartSession();
         }
 
-        private void OnDestroy() { StopSession(); }
-        private void OnApplicationQuit() { StopSession(); }
+        private void OnDestroy() { StopRoom(); StopSession(); }
+        private void OnApplicationQuit() { StopRoom(); StopSession(); }
 
         private void ParseCommandLine() {
             var a = Environment.GetCommandLineArgs();
@@ -104,6 +118,15 @@ namespace WasdDemo {
                 string next = i + 1 < a.Length ? a[i + 1] : "";
                 switch (a[i]) {
                     case "-player": hasPlayer = int.TryParse(next, out playerIndex); break;
+                    case "-host":
+                        // Host = P0, listen DefaultHostPort, peer on DefaultClientPort @ 127.0.0.1 (or -rip)
+                        playerIndex = 0; hasPlayer = true;
+                        break;
+                    case "-join":
+                        // Client = P1, connect to next arg as Host IP
+                        playerIndex = 1; hasPlayer = true;
+                        if (!string.IsNullOrEmpty(next) && !next.StartsWith("-")) remoteIp = next;
+                        break;
                     case "-lport": hasLport = int.TryParse(next, out localPort); break;
                     case "-rport": hasRport = int.TryParse(next, out remotePort); break;
                     case "-rip": remoteIp = next; break;
@@ -113,26 +136,23 @@ namespace WasdDemo {
                 }
             }
             playerIndex = Mathf.Clamp(playerIndex, 0, 1);
-            // "-player 1" alone should just work on localhost: P0 = 7000 -> 7001, P1 = 7001 -> 7000
-            if (hasPlayer && !hasLport) localPort = 7000 + playerIndex;
-            if (hasPlayer && !hasRport) remotePort = 7000 + (1 - playerIndex);
+            // Host/Client defaults: Host 7000↔7001, Client 7001↔7000
+            if (hasPlayer && !hasLport) localPort = playerIndex == 0 ? DefaultHostPort : DefaultClientPort;
+            if (hasPlayer && !hasRport) remotePort = playerIndex == 0 ? DefaultClientPort : DefaultHostPort;
         }
 
         private void SyncFieldsToStrings() {
-            sLocalPort = localPort.ToString();
-            sRemoteIp = remoteIp;
-            sRemotePort = remotePort.ToString();
+            sRoomHostIp = string.IsNullOrEmpty(roomHostIp) ? WasdRoom.DefaultRoomHostIp : roomHostIp;
+            sRoomPort = roomPort.ToString();
             sDelay = frameDelay.ToString();
         }
 
         // ============================================================ session
 
+        /// <summary>Legacy/direct start using public fields (playerIndex, localPort, remoteIp, remotePort). Prefer room Host/Join.</summary>
         private void StartSession() {
             error = "";
-            int.TryParse(sLocalPort, out localPort);
-            int.TryParse(sRemotePort, out remotePort);
-            int.TryParse(sDelay, out frameDelay);
-            remoteIp = sRemoteIp;
+            if (!string.IsNullOrEmpty(sDelay)) int.TryParse(sDelay, out frameDelay);
             try {
                 if (pluginLog) {
                     pluginLogDelegate = s => Debug.Log("[ggpo] " + s);
@@ -166,9 +186,127 @@ namespace WasdDemo {
             if (pluginLog) GGPO.SetLogDelegate(null);
         }
 
+        private void StopRoom() {
+            if (room != null) {
+                room.OnReady -= OnRoomReady;
+                room.Dispose();
+                room = null;
+            }
+            roomStatus = "";
+        }
+
+        // ============================================================ TCP room → GGPO
+
+        private void BeginHost() {
+            error = "";
+            StopRoom();
+            int.TryParse(sDelay, out frameDelay);
+            int.TryParse(sRoomPort, out roomPort);
+            roomHostIp = sRoomHostIp;
+
+            room = new WasdRoom {
+                RoomHostIp = roomHostIp,
+                RoomPort = roomPort,
+                GgpoPortP0 = DefaultHostPort,
+                GgpoPortP1 = DefaultClientPort
+            };
+            room.OnReady += OnRoomReady;
+            try {
+                Debug.Log("[wasd] BeginHost roomIp=" + roomHostIp + " roomPort=" + roomPort + " delay=" + frameDelay);
+                room.StartHostLocalP0();
+                roomStatus = room.Status;
+            }
+            catch (Exception e) {
+                error = e.Message;
+                Debug.LogError("[wasd] BeginHost failed: " + e);
+                Debug.LogException(e);
+                StopRoom();
+            }
+        }
+
+        private void BeginJoin() {
+            error = "";
+            StopRoom();
+            int.TryParse(sDelay, out frameDelay);
+            int.TryParse(sRoomPort, out roomPort);
+            roomHostIp = sRoomHostIp;
+
+            room = new WasdRoom {
+                RoomHostIp = roomHostIp,
+                RoomPort = roomPort,
+                GgpoPortP0 = DefaultHostPort,
+                GgpoPortP1 = DefaultClientPort
+            };
+            room.OnReady += OnRoomReady;
+            try {
+                Debug.Log("[wasd] BeginJoin → " + roomHostIp + ":" + roomPort + " delay=" + frameDelay);
+                room.StartClient();
+                roomStatus = room.Status;
+            }
+            catch (Exception e) {
+                error = e.Message;
+                Debug.LogError("[wasd] BeginJoin failed: " + e);
+                Debug.LogException(e);
+                StopRoom();
+            }
+        }
+
+        private void OnRoomReady(WasdRoom.RoomReadyInfo info) {
+            Debug.Log("[wasd] OnRoomReady local=P" + info.LocalIndex
+                + " peerIp=" + info.PeerIp
+                + " localPort=" + info.LocalGgpoPort
+                + " peerPort=" + info.PeerGgpoPort);
+            playerIndex = info.LocalIndex;
+            localPort = info.LocalGgpoPort;
+            remoteIp = info.PeerIp;
+            remotePort = info.PeerGgpoPort;
+            roomStatus = "Room ready → GGPO P" + info.LocalIndex + " peer=" + info.PeerIp
+                + " :" + info.PeerGgpoPort;
+
+            StartSessionFromRoom(info);
+        }
+
+        private void StartSessionFromRoom(WasdRoom.RoomReadyInfo info) {
+            error = "";
+            try {
+                Debug.Log("[wasd] StartSessionFromRoom → WasdRunner("
+                    + "localIndex=" + info.LocalIndex
+                    + ", localPort=" + info.LocalGgpoPort
+                    + ", remoteIp=" + info.PeerIp
+                    + ", remotePort=" + info.PeerGgpoPort
+                    + ", delay=" + frameDelay + ")");
+                if (pluginLog) {
+                    pluginLogDelegate = s => Debug.Log("[ggpo] " + s);
+                    GGPO.SetLogDelegate(pluginLogDelegate);
+                }
+                runner = new WasdRunner(info.LocalIndex, info.LocalGgpoPort,
+                    info.PeerIp, info.PeerGgpoPort, Mathf.Max(0, frameDelay));
+                runner.OnRollback += HandleRollback;
+                clock.Restart();
+                nextTickMs = 0;
+                lastStats = null;
+                Debug.Log("[wasd] GGPO session started, runner.Status=" + runner.Status);
+
+                if (logToFile) {
+                    csvPath = Path.Combine(Application.persistentDataPath, "wasd_rollback_P" + info.LocalIndex + ".csv");
+                    File.WriteAllText(csvPath, "time_s,target_frame,load_frame,depth,snap_local_u,snap_remote_u,ping_ms,est_depth_from_ping\n");
+                    Debug.Log("[wasd] rollback log: " + csvPath);
+                }
+            }
+            catch (Exception e) {
+                error = e.Message;
+                Debug.LogError("[wasd] StartSessionFromRoom FAILED: " + e);
+                Debug.LogException(e);
+                StopSession();
+            }
+        }
+
         // ============================================================ per render-frame
 
         private void Update() {
+            room?.Pump();
+            if (room != null) roomStatus = room.Status;
+
             HandleHotkeys();
             TickMarkers(Time.deltaTime);
             if (runner == null) return;
@@ -442,27 +580,42 @@ namespace WasdDemo {
         }
 
         private void DrawSetup() {
-            GUILayout.BeginArea(new Rect(20, 20, 340, 330), GUI.skin.box);
+            GUILayout.BeginArea(new Rect(20, 20, 400, 420), GUI.skin.box);
             GUILayout.Label("<b>WASD GGPO demo</b>", hudStyle);
-            GUILayout.Label("I am player:", hudStyle);
-            int p = GUILayout.SelectionGrid(playerIndex, new[] { "P0 (host side)", "P1 (join side)" }, 2);
-            if (p != playerIndex) {            // swap the default localhost ports along with the side
-                playerIndex = p;
-                int a = 7000 + p, b = 7000 + (1 - p);
-                sLocalPort = a.ToString();
-                sRemotePort = b.ToString();
-            }
-            GUILayout.Label("local port", hudStyle);
-            sLocalPort = GUILayout.TextField(sLocalPort);
-            GUILayout.Label("remote ip", hudStyle);
-            sRemoteIp = GUILayout.TextField(sRemoteIp);
-            GUILayout.Label("remote port", hudStyle);
-            sRemotePort = GUILayout.TextField(sRemotePort);
-            GUILayout.Label("local frame delay", hudStyle);
+            GUILayout.Label("<color=#aaaaaa>TCP room → auto GGPO  (like FishNet Host / Join)</color>", hudStyle);
+            GUILayout.Space(8);
+
+            GUILayout.Label("Room Host IP  <i>(同机用 127.0.0.1；跨机用 Host 局域网 IP)</i>", hudStyle);
+            sRoomHostIp = GUILayout.TextField(sRoomHostIp ?? WasdRoom.DefaultRoomHostIp);
+            GUILayout.Label("Room TCP port", hudStyle);
+            sRoomPort = GUILayout.TextField(sRoomPort ?? WasdRoom.DefaultRoomPort.ToString());
+
+            GUILayout.Space(6);
+            GUILayout.Label("frame delay (frames)", hudStyle);
             sDelay = GUILayout.TextField(sDelay);
-            bot = GUILayout.Toggle(bot, " bot input (same as key B)");
-            if (GUILayout.Button("Start GGPO session", GUILayout.Height(30))) StartSession();
-            if (error.Length > 0) GUILayout.Label("<color=#ff6060>" + error + "</color>", hudStyle);
+            bot = GUILayout.Toggle(bot, " bot input (key B)");
+
+            GUILayout.Space(12);
+            GUILayout.BeginHorizontal();
+            if (GUILayout.Button("Host (P0)", GUILayout.Height(40))) BeginHost();
+            if (GUILayout.Button("Join (P1)", GUILayout.Height(40))) BeginJoin();
+            GUILayout.EndHorizontal();
+
+            if (room != null && runner == null) {
+                GUILayout.Space(6);
+                GUILayout.Label("<b>Room:</b> " + roomStatus, hudStyle);
+                if (GUILayout.Button("Cancel room", GUILayout.Height(24))) StopRoom();
+            }
+
+            if (error.Length > 0) {
+                GUILayout.Space(4);
+                GUILayout.Label("<color=#ff6060>" + error + "</color>", hudStyle);
+            }
+
+            GUILayout.Space(8);
+            GUILayout.Label("<color=#888888>Host: 本机听 TCP，等人 Join 后自动开 GGPO 当 P0\n"
+                + "Join: 连上面 IP，进房后自动开 GGPO 当 P1\n"
+                + "GGPO 端口固定 P0=7000 / P1=7001</color>", hudStyle);
             GUILayout.EndArea();
         }
 
